@@ -1,4 +1,3 @@
-import csv
 import os
 import sys
 from googleapiclient.discovery import build
@@ -6,24 +5,15 @@ from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from supabase import create_client
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
-CSV_FILE = "subscriptions.csv"
 CLIENT_SECRET_FILE = "client_secret.json"
 TOKEN_FILE = "token.json"
-PROGRESS_FILE = "progress.txt"
 
-
-def load_progress():
-    if not os.path.exists(PROGRESS_FILE):
-        return set()
-    with open(PROGRESS_FILE) as f:
-        return {line.strip() for line in f if line.strip()}
-
-
-def save_progress(channel_id):
-    with open(PROGRESS_FILE, "a") as f:
-        f.write(channel_id + "\n")
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def authenticate():
@@ -46,15 +36,24 @@ def authenticate():
 
 
 def load_channels():
-    channels = []
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            channel_id = row.get("Channel ID", "").strip()
-            title = row.get("Channel title", "").strip()
-            if channel_id:
-                channels.append((channel_id, title))
-    return channels
+    rows = supabase.table("channels").select("channel_id, title").execute()
+    return [(r["channel_id"], r["title"] or "") for r in rows.data]
+
+
+def load_progress():
+    rows = (
+        supabase.table("channels")
+        .select("channel_id")
+        .neq("status", "pending")
+        .execute()
+    )
+    return {r["channel_id"] for r in rows.data}
+
+
+def save_progress(channel_id, status="subscribed"):
+    supabase.table("channels").update(
+        {"status": status, "processed_at": "now()"}
+    ).eq("channel_id", channel_id).execute()
 
 
 def main():
@@ -63,7 +62,7 @@ def main():
 
     channels = load_channels()
     processed = load_progress()
-    print(f"Loaded {len(channels)} channels from {CSV_FILE}")
+    print(f"Loaded {len(channels)} channels from Supabase")
     print(f"Already processed (will skip): {len(processed)}\n")
 
     subscribed = 0
@@ -89,26 +88,28 @@ def main():
             ).execute()
             print(f"[{i}/{len(channels)}] Subscribed: {label}")
             subscribed += 1
-            save_progress(channel_id)
+            save_progress(channel_id, "subscribed")
         except HttpError as e:
             if e.status_code in (409, 400) and "subscriptionDuplicate" in str(e):
                 print(f"[{i}/{len(channels)}] Already subscribed: {label}")
                 skipped += 1
-                save_progress(channel_id)
+                save_progress(channel_id, "duplicate")
             elif e.status_code == 403:
                 reason = ""
                 if e.error_details:
                     reason = e.error_details[0].get("reason", "")
                 if reason == "quotaExceeded":
                     print(f"\nQuota exceeded after {subscribed} new subscriptions.")
-                    print("Re-run tomorrow — already-subscribed channels will be skipped automatically.")
+                    print("Re-run tomorrow — already-processed channels will be skipped automatically.")
                     break
                 else:
                     print(f"[{i}/{len(channels)}] Forbidden ({reason}): {label}")
                     errors += 1
+                    save_progress(channel_id, "error")
             else:
                 print(f"[{i}/{len(channels)}] Error {e.status_code}: {label} — {e}")
                 errors += 1
+                save_progress(channel_id, "error")
 
     print(f"\nDone. Subscribed: {subscribed} | Already subscribed (skipped): {skipped} | Errors: {errors}")
 
